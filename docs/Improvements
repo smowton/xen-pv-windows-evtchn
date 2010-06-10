@@ -1,0 +1,4 @@
+1. Security
+-----------
+
+AFAIK the Windows drivers are currently configured to be accessible to anybody. This should be changed, or unprivileged apps could use the Xenstore driver to e.g. trash the Xenbus records for local devices, and so crash the system.

@@ -1,0 +1,23 @@
+Build instructions for GPLPV drivers
+------------------------------------
+
+This is a patchset against James Harper's PV drivers for Windows NT Xen guests. See http://wiki.xensource.com/xenwiki/XenWindowsGplPv. This patch applies cleanly against at least http://xenbits.xensource.com/ext/win-pvdrivers.hg changeset 706.
+
+1. hg-fetch from the GPLPV sources above.
+2. Apply gplpv_kernel/gplpv-kernel.patch in subdirectory xenpci/
+3. Add files gplpv_kernel/evtchn/evtchn_device_interface.c and gntmem_device_interface.c in xenpci/
+4. Add both those files to the 'sources' list
+5. Build as indicated in James' documentation
+
+Building GPLPV userspace DLLs
+-----------------------------
+
+For each subdirectory of gplpv_userspace except 'include', build as follows:
+
+1. Make a trivial Visual Studio project (or use cl.exe and link.exe directly)
+2. Build the .c files into a DLL using the .def file to define its exports (set the Resource Definition file property or use the /DEF: switch).
+3. Be sure to supply as include paths gplpv_userspace/include, gplpv_kernel/include and (GPLPV root)/include and (GPLPV root)/include/public.
+
+This should generate a load of DLLs in out\(arch)\release\bin\additions.
+
+Installation should be as for the normal GPLPV drivers.

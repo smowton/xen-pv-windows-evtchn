@@ -1,0 +1,31 @@
+Here is a summary of what's where in the repository, and what it does.
+
+gplpv_kernel
+------------
+
+Patches to, and major additions to, James Harper's GPLPV drivers for Windows, providing userspace support for Xen event channels and memory-granting using grant tables. The root contains a patch which applies cleanly against the xenpci subdirectory of the tip of his Hg repository to apply all changes which aren't just whole new files. Complete copies of my modified versions are in evtchn/modified.
+
+gplpv_kernel/evtchn
+-------------------
+
+Contains the event channel driver; should be placed in xenpci/ and added to the 'sources' list. This is at heart a direct port of the Linux drivers/evtchn/evtchn.c, but with modifications to suit the Windows approach to asynchrony. It takes care of most features of the Linux driver, such as cleaning up after dead processes, but does not permit interdomain-bind or bind-to-irq operations, as the core GPLPV drivers don't support those yet. In practice this is no problem, as it does support allocate-unbound-channel, meaning event channel links can be established so long as the guest is the passive party.
+
+gplpv_kernel/gntmem
+-------------------
+
+Contains the memory granting; should be again placed in xenpci/. This has no direct Linux equivalent (it is not gntdev; rather it is the opposite, a device for granting one's own memory to another domain). Whilst it's task is very simple, its bulk is considerable, as mapping memory using a Windows driver is a tricky affair compared to Linux's simple mmap. For comparison, this 700-line WDF driver corresponds to 150 lines of Linux kernel code.
+
+gplpv_kernel/public
+-------------------
+
+These are userland-kernel interface definitions; primarily IOCTL declarations and structures giving their arguments. Needed to build the gplpv_userspace stuff.
+
+gplpv_userspace
+---------------
+
+This is a set of userland DLLs which provide friendly interfaces to the kernel drivers, and in some cases strongly resemble their Linux counterparts. Exactly where and why they differ is discussed in another document. There is no build infrastructure, but building is trivial; each directory contains a number of .c files (usually 1) and a single .def giving the DLL exports. These all require access to gplpv_kernel/public in order to build. Of the three DLLs, evtchn and gntmem are trivial IOCTL wrappers; Xenstore however is a full port of the Linux libxs, including some fun threading to deal with the interleaving of firing watches and user operations.
+
+gplpv_userspace/include
+-----------------------
+
+The public interfaces to the userland DLLs

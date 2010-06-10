@@ -1,0 +1,86 @@
+evtchn_device_interface.c and gntmem_device_interface.c implement interfaces to the Windows PVGPL Xen drivers by James Harper, providing userland access to event channels and grant tables respectively. Both drivers are, like most of the GPLPV drivers, Windows Driver Foundation (WDF) drivers.
+
+I also supply userspace DLLs resembling their Linux counterparts for using Xenstore as well as EvtChn and GntMem.
+
+The author can be contacted at <chris.smowton@cl.cam.ac.uk>.
+
+Event channels
+--------------
+
+The event channel driver is essentially a direct port of the Linux driver found at (linux root)/drivers/xen/evtchn/evtchn.c. It is however modified to suit Windows' approach to I/O.
+
+Supported features:
+* Allocating unbound local event channels
+* Signalling, unmasking, and waiting for those channels
+* Unbinding bound channels
+
+Missing features:
+* Binding channels allocated by other domains
+* Binding channels to VIRQs
+
+The operation "bind-interdomain" is missing because it is missing at present from the core PVGPL drivers. It is missing there also because all current applications communicate between a guest and domain 0, who is capable of interdomain binding. Therefore in any situation it suffices for the guest to allocate a channel, pass its ID out of band to dom0 (e.g. through Xenstore,) and have dom0 complete the connection.
+
+The user API provided by EvtChn's userspace DLL is similar to the applicable subset of xenctrl.h, with some noteworthy changes:
+
+* As stated above, xc_evtchn_bind_interdomain and bind_virq will always fail in the kernel driver.
+* xc_evtchn_open and xc_evtchn_fd return HANDLEs rather than integers, since Windows files are ordinarily represented that way.
+* Asynchronous waiting for events should not use select(), as in Windows that function is only for use with WinSock socket descriptors. Instead, one should use the HANDLE returned from xc_evtchn_fd in one of Windows' asynchronous I/O functions. Reads from the HANDLE yield the port numbers of signalled channels, whilst writes to it unmask those channels. The functions xc_evtchn_pending and xc_evtchn_unmask simply perform a blocking read or write of a single port respectively.
+
+As an example, one might allocate a global OVERLAPPED, and initialise its hEvent member to a fresh, manually reset event (as according to MS's advice on events in OVERLAPPED structures). Then allocate a global store for some event channel ports (i.e. a global array of evtchn_port_t), and start an asynchronous read into that buffer. In your application's main loop, use WaitForSingle or Multiple objects on that hEvent, and when it becomes signalled, examine the results of your read using GetOverlappedResult.
+
+Note that the HANDLE from xc_evtchn_fd can be used with other Windows asynchrony techniques as well, including but not limited to use of ReadFileEx with completion APCs, and use of I/O completion ports. Finally note that there's no reason not to intermix async use of Write|ReadFile(Ex) and synchronous use of xc_evtchn_unmask/pending.
+
+One more deviation from the Linux event channel interface worth noting is that whilst under Linux, if one gets an event on a channel, then another event occurs before one is able to call xc_evtchn_unmask, upon unmasking the channel fires again (it fires once, regardless of how many times it was signalled whilst masked). Under Windows it *does not* fire again; it will fire the next time it is signalled *after* unmask is called. This means that one must unmask the channel first, then check for whatever condition the channel is intended to signal, then wait on the channel.
+
+This difference is mainly due to my inexpertise with triggering interrupts or pseudo-interrupts in the Windows drivers, and may be amended to perfectly resemble the Linux driver in the future.
+
+EvtChn's internal implementation is mostly unremarkable. It simply uses the PVGPL drivers' internal event channel support to attach a DPC to each channel its user is watching, and whenever one fires, tries to satisfy an internal queue of pending reads, also masking the channel pending a user call to xc_evtchn_unmask (i.e., a write to the device).
+
+Memory granting
+---------------
+
+The memory-granting driver has no equivalent in the current Linux or Xenlinux mainline (though I have written a Linux driver out-of-tree). It is the logical opposite of Linux's /dev/gntdev -- where gntdev permits one to specify grants in the grant-tables of remote domains and map that memory into a process address space, this driver (GntMem), allows one to allocate local system memory, issue grants against it, and map into local address space. These grants can then be handed to a remote domain who can map them using gntdev.
+
+The interface to the driver is entirely my own invention, since there was no equivalent to imitate. The available functions are:
+
+gntmem_open: Opens the kernel device
+gntmem_close: Closes the kernel device, and unmaps all grants
+gntmem_set_local_quota: Sets the maximum number of pages this instance of the device is allowed to map
+gntmem_set_global_quota: Sets the maximum number of pages which can be mapped by the total of all gntmem instances on this system.
+gntmem_grant_pages_to_domain: Allocates and grants a block of memory, specified in pages, returning a local virtual address and an array of grants for use in a remote gntdev.
+
+More details are given in the include file xen_gntmem.h.
+
+The implementation of the device is fairly complicated, because Windows' support for memory mapping is poor. The device works by associating each granted memory region with a pending IOCTL; that is, upon a call to gntmem_grant_pages_to_domain, the user library issues an asynchronous IOCTL against the device which will not return until the section is unmapped. A second IOCTL to get the details of the new section then follows.
+
+The reason for this moderately insane structure is that Windows does not guarantee a callback into my driver when processes for whom I have created memory mappings are dying. This means that I have no opportunity to unmap the memory, which causes a BSOD as Windows assumes I have left memory locked from a previous I/O request, and have no signal that I can rescind the grant table entries associated with the memory, permitting me to free the grant table space and the pages themselves.
+
+By using a pending IOCTL, however, I am guaranteed a CancelIo callback from the kernel when the issuing thread is terminating. I can then use that callback to unmap the memory and free the grants. This does, however, introduce the problem that the memory will be unmapped on thread termination even if the process and associated VAS remains, which might mean mappings disappear from beneath other threads.
+
+As such, device users should only start mappings from threads which are very likely to remain alive as long as the process. Given that this can't always be guaranteed, they should also handle memory faults in mapped regions.
+
+Calls to gntmem_close will cause the outstanding I/O to be cancelled and the sections unmapped in similar fashion. As Win32 does not permit cancellation of specific I/O, but rather only that issued by the calling thread on the specified handle, users should be sure to call close from the same thread who issued the grant_pages calls, and be aware that *all* sections issued by that device will be unmapped at that time.
+
+If it is required for more than one thread to create sections, or for sections to be individually unmapped, the device will need to be opened multiple times.
+
+Xenstore
+--------
+
+The Xenstore userspace DLL provided is a direct port of Xen mainline's libxenstore. It differs in only one way, again related to I/O technique: it replaces xs_fileno, which would typically yield a file descriptor to be used with select(2) or poll(2), with xs_register_watch_event and xs_unregister_watch_event. These add and remove respectively a specified Win32 Event to a list of Events which will become signalled any time a watch fires.
+
+Because the event will become signalled once even if multiple watches fire, I have added a parameter to xs_read_watch, which is a boolean specifying whether the operation blocks. Therefore, a process wanting to respond to asynchronous Xenstore watches might use code like:
+
+h = CreateEvent(NULL,FALSE,FALSE,NULL);
+
+xs_register_watch_event(h);
+
+while(1) {
+	 char** next_watch;
+	 unsigned int next_watch_len;
+	 while(next_watch = xs_read_watch(xsh, &next_watch_len, 0 /* don't block */)) {
+	 // Do something with the watches
+	 }
+	 WaitForSingleObject(h, INFINITE);
+}
+
+Besides this change, almost all implementation matches the Xen mainline version, including its thread structure.

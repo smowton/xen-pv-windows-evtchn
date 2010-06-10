@@ -1,0 +1,422 @@
+diff -uN -r harper/evtchn.c smowton/evtchn.c
+--- harper/evtchn.c	2009-10-17 15:31:51.234375000 -0600
++++ smowton/evtchn.c	2009-10-28 13:54:33.796875000 -0600
+@@ -144,11 +144,14 @@
+     evt_words &= ~(1 << evt_word);
+     while (bit_scan_forward(&evt_bit, shared_info_area->evtchn_pending[evt_word] & ~shared_info_area->evtchn_mask[evt_word]))
+     {
+-      synch_clear_bit(evt_bit, (volatile xen_long_t *)&shared_info_area->evtchn_pending[evt_word]);
+-      handled = TRUE;
+       port = (evt_word << BITS_PER_LONG_SHIFT) + evt_bit;
+       ev_action = &xpdd->ev_actions[port];
+       ev_action->count++;
++	  if(ev_action->mask_on_fire) {
++		  EvtChn_Mask(xpdd, port);
++	  }
++      synch_clear_bit(evt_bit, (volatile xen_long_t *)&shared_info_area->evtchn_pending[evt_word]);
++      handled = TRUE;
+       switch (ev_action->type)
+       {
+       case EVT_ACTION_TYPE_NORMAL:
+@@ -237,6 +240,7 @@
+   xpdd->ev_actions[Port].ServiceRoutine = ServiceRoutine;
+   xpdd->ev_actions[Port].ServiceContext = ServiceContext;
+   xpdd->ev_actions[Port].xpdd = xpdd;
++  xpdd->ev_actions[Port].mask_on_fire = FALSE;
+   KeMemoryBarrier();
+   xpdd->ev_actions[Port].type = EVT_ACTION_TYPE_NORMAL;
+ 
+@@ -248,7 +252,7 @@
+ }
+ 
+ NTSTATUS
+-EvtChn_BindDpc(PVOID Context, evtchn_port_t Port, PXEN_EVTCHN_SERVICE_ROUTINE ServiceRoutine, PVOID ServiceContext)
++EvtChn_BindDpcReplace(PVOID Context, evtchn_port_t Port, PXEN_EVTCHN_SERVICE_ROUTINE ServiceRoutine, PVOID ServiceContext, BOOLEAN replace, BOOLEAN mask_on_fire)
+ {
+   PXENPCI_DEVICE_DATA xpdd = Context;
+ 
+@@ -256,11 +260,20 @@
+ 
+   if (xpdd->ev_actions[Port].type != EVT_ACTION_TYPE_EMPTY)
+   {
+-    xpdd->ev_actions[Port].type = EVT_ACTION_TYPE_EMPTY;
+-    KeMemoryBarrier(); // make sure we don't call the old Service Routine with the new data...
+-    KdPrint((__DRIVER_NAME " Handler for port %d already registered, replacing\n", Port));
++	  if(replace) {
++		xpdd->ev_actions[Port].type = EVT_ACTION_TYPE_EMPTY;
++		KeMemoryBarrier(); // make sure we don't call the old Service Routine with the new data...
++		KdPrint((__DRIVER_NAME " Handler for port %d already registered, replacing\n", Port));
++	  }
++	  else {
++		  return STATUS_INVALID_PARAMETER;
++	  }
+   }
+ 
++  if(mask_on_fire) {
++	  KdPrint(("Setting event port %d to mask-on-fire\n", Port));
++  }
++  xpdd->ev_actions[Port].mask_on_fire = mask_on_fire;
+   xpdd->ev_actions[Port].ServiceRoutine = ServiceRoutine;
+   xpdd->ev_actions[Port].ServiceContext = ServiceContext;
+   xpdd->ev_actions[Port].xpdd = xpdd;
+@@ -276,6 +289,13 @@
+ }
+ 
+ NTSTATUS
++EvtChn_BindDpc(PVOID Context, evtchn_port_t Port, PXEN_EVTCHN_SERVICE_ROUTINE ServiceRoutine, PVOID ServiceContext) {
++
++	return EvtChn_BindDpcReplace(Context, Port, ServiceRoutine, ServiceContext, TRUE, FALSE);
++
++}
++
++NTSTATUS
+ EvtChn_BindIrq(PVOID Context, evtchn_port_t Port, ULONG vector, PCHAR description)
+ {
+   PXENPCI_DEVICE_DATA xpdd = Context;
+@@ -291,6 +311,7 @@
+ 
+   xpdd->ev_actions[Port].vector = vector;
+   xpdd->ev_actions[Port].xpdd = xpdd;
++  xpdd->ev_actions[Port].mask_on_fire = FALSE;
+   KeMemoryBarrier();
+   xpdd->ev_actions[Port].type = EVT_ACTION_TYPE_IRQ;
+   strncpy(xpdd->ev_actions[Port].description, description, 128);
+@@ -344,6 +365,21 @@
+   return STATUS_SUCCESS;
+ }
+ 
++/* Un-pends an event channel which was pending.
++   Intended to allow userspace evtchn to get more events even if
++   the channel fired whilst it was masked.
++   Beware race: Must unmask, then reset, which might cause a spurious double-fire. */
++
++NTSTATUS
++EvtChn_Reset(PVOID context, evtchn_port_t port) 
++{
++  PXENPCI_DEVICE_DATA xpdd = context;
++
++  synch_clear_bit(port & (BITS_PER_LONG - 1),
++    (volatile xen_long_t *)&xpdd->shared_info_area->evtchn_pending[port >> BITS_PER_LONG_SHIFT]);
++  return STATUS_SUCCESS;
++}
++
+ NTSTATUS
+ EvtChn_Notify(PVOID Context, evtchn_port_t Port)
+ {
+diff -uN -r harper/xenbus_device_interface.c smowton/xenbus_device_interface.c
+--- harper/xenbus_device_interface.c	2009-10-17 15:31:51.343750000 -0600
++++ smowton/xenbus_device_interface.c	2009-10-24 23:17:11.234375000 -0600
+@@ -225,6 +225,8 @@
+   WDFFILEOBJECT file_object = WdfRequestGetFileObject(request);
+   PXENPCI_DEVICE_INTERFACE_DATA xpdid = GetXpdid(file_object);
+   KIRQL old_irql;
++  WDFREQUEST read_request;
++
+   PUCHAR buffer;
+   PUCHAR src_ptr;
+   ULONG src_len;
+@@ -342,6 +344,23 @@
+     list_entry->length = sizeof(*rep) + rep->len;
+     list_entry->offset = 0;
+     InsertTailList(&xpdid->xenbus.read_list_head, (PLIST_ENTRY)list_entry);
++
++	// Check if someone was waiting for the answer already
++	status = WdfIoQueueRetrieveNextRequest(xpdid->xenbus.io_queue, &read_request);
++    if (NT_SUCCESS(status))
++    {
++		WDF_REQUEST_PARAMETERS parameters;
++		KdPrint((__DRIVER_NAME "     post-write: found pending read\n"));
++		WDF_REQUEST_PARAMETERS_INIT(&parameters);
++		WdfRequestGetParameters(read_request, &parameters);
++		XenBus_ProcessReadRequest(xpdid->xenbus.io_queue, read_request, parameters.Parameters.Read.Length);
++		WdfRequestComplete(read_request, STATUS_SUCCESS);
++    }
++    else
++    {
++		KdPrint((__DRIVER_NAME "     post-write: no pending read (%08x)\n", status));
++    }
++
+     KeReleaseSpinLock(&xpdid->lock, old_irql);
+   }
+   KdPrint((__DRIVER_NAME "     completing request with length %d\n", length));
+diff -uN -r harper/xenpci.c smowton/xenpci.c
+--- harper/xenpci.c	2009-10-17 15:31:51.390625000 -0600
++++ smowton/xenpci.c	2009-10-23 19:18:35.531250000 -0600
+@@ -77,6 +77,9 @@
+   WDFKEY param_key;
+   DECLARE_CONST_UNICODE_STRING(veto_devices_name, L"veto_devices");
+   WDF_DEVICE_POWER_CAPABILITIES power_capabilities;
++  WDF_OBJECT_ATTRIBUTES request_attributes;
++  WDF_TIMER_CONFIG timer_config;
++  WDF_OBJECT_ATTRIBUTES timer_attributes;
+   int i;
+   
+   UNREFERENCED_PARAMETER(driver);
+@@ -95,6 +98,10 @@
+ 
+   WdfDeviceInitSetPnpPowerEventCallbacks(device_init, &pnp_power_callbacks);
+ 
++  WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&request_attributes, XENPCI_REQUEST_DATA);
++  WdfDeviceInitSetRequestAttributes(device_init, &request_attributes);
++  WdfDeviceInitSetIoInCallerContextCallback(device_init, XenPci_EvtIoInCallerContext);
++
+   WdfDeviceInitSetDeviceType(device_init, FILE_DEVICE_BUS_EXTENDER);
+   WdfDeviceInitSetExclusive(device_init, FALSE);
+ 
+@@ -121,6 +128,20 @@
+   xpdd = GetXpdd(device);
+   xpdd->wdf_device = device;
+   xpdd->child_list = WdfFdoGetDefaultChildList(device);
++  WdfSpinLockCreate(NULL, &xpdd->evtchn_port_user_lock);
++
++  /* gntmem globals setup */
++
++  WDF_TIMER_CONFIG_INIT_PERIODIC(&timer_config, GntMem_EvtTimerFunc, 10000 /* 10 seconds */);
++  WDF_OBJECT_ATTRIBUTES_INIT(&timer_attributes);
++  timer_attributes.ParentObject = device;
++  WdfTimerCreate(&timer_config, &timer_attributes, &xpdd->gntmem_cleanup_timer);
++  xpdd->gntmem_allowed_pages = 0;
++  xpdd->gntmem_mapped_pages = 0;
++  xpdd->gntmem_free_work_queued = 0;
++  InitializeListHead(&xpdd->gntmem_pending_free_list_head);
++  WdfSpinLockCreate(NULL, &xpdd->gntmem_quota_lock);
++  WdfSpinLockCreate(NULL, &xpdd->gntmem_pending_free_lock);
+ 
+   WdfCollectionCreate(WDF_NO_OBJECT_ATTRIBUTES, &veto_devices);
+   status = WdfDriverOpenParametersRegistryKey(driver, KEY_QUERY_VALUE, WDF_NO_OBJECT_ATTRIBUTES, &param_key);
+@@ -202,8 +223,8 @@
+       return status;
+   }
+ 
+-  RtlInitUnicodeString(&reference, L"gntdev");
+-  status = WdfDeviceCreateDeviceInterface(device, &GUID_DEVINTERFACE_GNTDEV, &reference);
++  RtlInitUnicodeString(&reference, L"gntmem");
++  status = WdfDeviceCreateDeviceInterface(device, &GUID_DEVINTERFACE_GNTMEM, &reference);
+   if (!NT_SUCCESS(status)) {
+       KdPrint(("Error registering device interface 0x%x\n", status));
+       return status;
+diff -uN -r harper/xenpci.h smowton/xenpci.h
+--- harper/xenpci.h	2009-10-17 15:31:51.390625000 -0600
++++ smowton/xenpci.h	2009-10-28 14:07:03.734375000 -0600
+@@ -81,6 +81,7 @@
+   ULONG vector;
+   ULONG count;
+   PVOID xpdd;
++  BOOLEAN mask_on_fire;
+ } ev_action_t;
+ 
+ typedef struct _XENBUS_WATCH_RING
+@@ -179,6 +180,19 @@
+   struct xsd_sockmsg *xb_reply;
+   struct xsd_sockmsg *xb_msg;
+   ULONG xb_msg_offset;
++
++  /* userspace evtchn related ("global" storage) */
++  VOID* evtchn_port_user[NR_EVENTS];
++  WDFSPINLOCK evtchn_port_user_lock;
++
++  /* userspace gntmem related global storage */
++  int gntmem_mapped_pages;
++  int gntmem_allowed_pages;
++  BOOLEAN gntmem_free_work_queued;
++  LIST_ENTRY gntmem_pending_free_list_head;
++  WDFSPINLOCK gntmem_pending_free_lock;
++  WDFSPINLOCK gntmem_quota_lock;
++  WDFTIMER gntmem_cleanup_timer;
+   
+   WDFCHILDLIST child_list;
+ 
+@@ -326,7 +340,7 @@
+ //#define DEVICE_INTERFACE_TYPE_LEGACY 0
+ #define DEVICE_INTERFACE_TYPE_XENBUS 1
+ #define DEVICE_INTERFACE_TYPE_EVTCHN 2
+-#define DEVICE_INTERFACE_TYPE_GNTDEV 3
++#define DEVICE_INTERFACE_TYPE_GNTMEM 3
+ 
+ typedef struct {
+   ULONG len;
+@@ -340,12 +354,23 @@
+ } XENBUS_INTERFACE_DATA, *PXENBUS_INTERFACE_DATA;
+ 
+ typedef struct {
+-  ULONG dummy; /* fill this in with whatever is required */
++
++	WDFQUEUE io_queue;
++	evtchn_port_t *ring;
++	unsigned int ring_cons, ring_prod, ring_overflow;
++	WDFSPINLOCK lock;
++	LIST_ENTRY bound_channels_list_head;
++
++	domid_t restrict_domid;
++
+ } EVTCHN_INTERFACE_DATA, *PEVTCHN_INTERFACE_DATA;
+ 
+ typedef struct {
+-  ULONG dummy;  /* fill this in with whatever is required */
+-} GNTDEV_INTERFACE_DATA, *PGNTDEV_INTERFACE_DATA;
++  WDFQUEUE pending_grant_requests;
++  WDFSPINLOCK pending_queue_lock;
++  int mapped_pages;
++  int allowed_pages;
++} GNTMEM_INTERFACE_DATA, *PGNTMEM_INTERFACE_DATA;
+ 
+ typedef struct {
+   ULONG type;
+@@ -356,14 +381,36 @@
+   union {
+     XENBUS_INTERFACE_DATA xenbus;
+     EVTCHN_INTERFACE_DATA evtchn;
+-    GNTDEV_INTERFACE_DATA gntdev;
++    GNTMEM_INTERFACE_DATA gntmem;
+   };
+ } XENPCI_DEVICE_INTERFACE_DATA, *PXENPCI_DEVICE_INTERFACE_DATA;
+ 
+ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(XENPCI_DEVICE_INTERFACE_DATA, GetXpdid)
+ 
++struct grant_record;
++
++typedef struct {
++	PMDL mdl;
++	PVOID base_vaddr;
++	PEPROCESS process;
++	struct grant_record* record;
++	INT32 uid;
++} XENPCI_REQUEST_DATA, *PXENPCI_REQUEST_DATA;
++
++WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(XENPCI_REQUEST_DATA, GetRequestData);
++
+ NTSTATUS
+ XenBus_DeviceFileInit(WDFDEVICE device, PWDF_IO_QUEUE_CONFIG queue_config, WDFFILEOBJECT file_object);
++NTSTATUS
++EvtChn_DeviceFileInit(WDFDEVICE device, PWDF_IO_QUEUE_CONFIG queue_config, WDFFILEOBJECT file_object);
++NTSTATUS
++GntMem_DeviceFileInit(WDFDEVICE device, PWDF_IO_QUEUE_CONFIG queue_config, WDFFILEOBJECT file_object);
++
++VOID
++XenPci_EvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request);
++VOID
++GntMem_EvtIoInCallerContext(PXENPCI_DEVICE_INTERFACE_DATA xpdid, WDFREQUEST Request, WDFDEVICE Device);
++VOID GntMem_EvtTimerFunc(WDFTIMER timer);
+ 
+ EVT_WDF_DEVICE_FILE_CREATE XenPci_EvtDeviceFileCreate;
+ EVT_WDF_FILE_CLOSE XenPci_EvtFileClose;
+@@ -512,10 +559,14 @@
+ NTSTATUS
+ EvtChn_Unmask(PVOID Context, evtchn_port_t Port);
+ NTSTATUS
++EvtChn_Reset(PVOID Context, evtchn_port_t Port);
++NTSTATUS
+ EvtChn_Bind(PVOID Context, evtchn_port_t Port, PXEN_EVTCHN_SERVICE_ROUTINE ServiceRoutine, PVOID ServiceContext);
+ NTSTATUS
+ EvtChn_BindDpc(PVOID Context, evtchn_port_t Port, PXEN_EVTCHN_SERVICE_ROUTINE ServiceRoutine, PVOID ServiceContext);
+ NTSTATUS
++EvtChn_BindDpcReplace(PVOID Context, evtchn_port_t Port, PXEN_EVTCHN_SERVICE_ROUTINE ServiceRoutine, PVOID ServiceContext, BOOLEAN replace, BOOLEAN mask_on_fire);
++NTSTATUS
+ EvtChn_BindIrq(PVOID Context, evtchn_port_t Port, ULONG vector, PCHAR description);
+ evtchn_port_t
+ EvtChn_AllocIpi(PVOID context, ULONG vcpu);
+diff -uN -r harper/xenpci_device_interface.c smowton/xenpci_device_interface.c
+--- harper/xenpci_device_interface.c	2009-10-17 15:31:51.437500000 -0600
++++ smowton/xenpci_device_interface.c	2009-10-22 09:44:38.796875000 -0600
+@@ -25,14 +25,62 @@
+   NTSTATUS status;
+   PXENPCI_DEVICE_INTERFACE_DATA xpdid = GetXpdid(file_object);
+   WDF_IO_QUEUE_CONFIG queue_config;
++  PUNICODE_STRING filename = WdfFileObjectGetFileName(file_object);
++  PWSTR reference_token;
+   
+   FUNCTION_ENTER();
+-  
+-  xpdid->type = DEVICE_INTERFACE_TYPE_XENBUS; //TODO: determine the actual type
++
++  KdPrint(("XenPci_EvtDeviceFileCreate: file is %wZ\n", filename));
++
++  if(filename->Length < 12) { /* 6 wide chars */
++	  if(!filename->Buffer) {
++		  KdPrint(("Failed to create a device file because the file object had no name\n"));
++	  }
++	  else {
++		  KdPrint(("Failed to create a device file for %wZ because the name is too short\n", filename));
++	  }
++	  WdfRequestComplete(request, STATUS_UNSUCCESSFUL);
++	  return;
++  }
++
++  // i.e. a pointer to the last 6 wide-chars of the buffer.
++  // I can't find any better way of referencing a substring on a UNICODE_STRING...
++  // ...but that's mostly because MSDN documentation is the work of Hades himself...
++  reference_token = (PWSTR)(((char*)filename->Buffer) + (filename->Length - 12));
++
++  KdPrint(("First 6 wchars of ref_token: %wc%wc%wc%wc%wc%wc",
++	  reference_token[0], reference_token[1], reference_token[2],
++	  reference_token[3], reference_token[4], reference_token[5]));
++
++  if(RtlCompareMemory(reference_token, L"xenbus", 12) == 12) {
++	  KdPrint(("File type matches Xenbus\n"));
++	  xpdid->type = DEVICE_INTERFACE_TYPE_XENBUS;
++  }
++  else if(RtlCompareMemory(reference_token, L"evtchn", 12) == 12) {
++	  KdPrint(("File type matches Evtchn\n"));
++	  xpdid->type = DEVICE_INTERFACE_TYPE_EVTCHN;
++  }
++  else if(RtlCompareMemory(reference_token, L"gntmem", 12) == 12) {
++  	  KdPrint(("File type matches Gntmem\n"));
++	  xpdid->type = DEVICE_INTERFACE_TYPE_GNTMEM;
++  }
++  else {
++	  KdPrint(("Failed to create a device file: %wZ does not end with a valid reference string\n", filename));
++	  WdfRequestComplete(request, STATUS_UNSUCCESSFUL);
++	  return;
++  }
+   
+   KeInitializeSpinLock(&xpdid->lock);
+   WDF_IO_QUEUE_CONFIG_INIT(&queue_config, WdfIoQueueDispatchSequential);
+-  status = XenBus_DeviceFileInit(device, &queue_config, file_object); /* this completes the queue init */  
++  if(xpdid->type == DEVICE_INTERFACE_TYPE_XENBUS) {
++	  status = XenBus_DeviceFileInit(device, &queue_config, file_object); /* this completes the queue init */  
++  }
++  else if(xpdid->type == DEVICE_INTERFACE_TYPE_EVTCHN) {
++	  status = EvtChn_DeviceFileInit(device, &queue_config, file_object);
++  }
++  else {
++	  status = GntMem_DeviceFileInit(device, &queue_config, file_object);
++  }
+   if (!NT_SUCCESS(status)) {
+       WdfRequestComplete(request, STATUS_UNSUCCESSFUL);
+   }
+@@ -48,6 +96,35 @@
+ }
+ 
+ VOID
++XenPci_EvtIoInCallerContext(WDFDEVICE Device, WDFREQUEST Request) {
++
++	PXENPCI_DEVICE_INTERFACE_DATA xpdid;
++	WDFFILEOBJECT file;
++	NTSTATUS status;
++	
++	file = WdfRequestGetFileObject(Request);
++	if(!file) {
++		KdPrint(("XenPci_EvtIoInCallerContext: rejected request for null file\n"));
++		WdfRequestComplete(Request, STATUS_INVALID_PARAMETER);
++	}
++
++	xpdid = GetXpdid(file);
++
++	if(xpdid->type == DEVICE_INTERFACE_TYPE_GNTMEM) {
++		GntMem_EvtIoInCallerContext(xpdid, Request, Device); // Responsible for calling enqueue
++	}
++	else {
++		status = WdfDeviceEnqueueRequest(Device, Request);
++		if(!NT_SUCCESS(status)) {
++			KdPrint(("XenPci_EvtIoInCallerContext: failed to enqueue request: error %x\n", status));
++			WdfRequestComplete(Request, status);
++		}
++		// else, drop out -- the request will now be fed to EvtRead, EvtWrite etc
++	}
++
++}
++
++VOID
+ XenPci_EvtFileCleanup(WDFFILEOBJECT file_object)
+ {
+   PXENPCI_DEVICE_INTERFACE_DATA xpdid = GetXpdid(file_object);
